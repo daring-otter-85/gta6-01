@@ -1,79 +1,165 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=cover|street|mission|harbor. Each one plays the real
+// rules forward from a fresh world for a fixed number of steps, steered by a simple
+// autopilot (drive toward a point on the road, walk toward a target, shoot the nearest
+// enemy), so the frame is what a short game really looks like and the same seed always
+// gives the same frame.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { STEP } from './config.js';
+import { SCREEN_PLAY } from './render.js';
+import { startMission } from './missions.js';
+import { angleDiff } from './player.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+const SILENT = {
+  engine() {}, siren() {}, shot() {}, enemyShot() {}, blip() {}, crash() {},
+  jingle() {}, fail() {}, arrest() {},
+};
+
+/** Drive input steering the player's car toward (tx, ty). */
+function driveInput(state, tx, ty) {
+  const car = state.player.car;
+  const diff = angleDiff(car.angle, Math.atan2(ty - car.y, tx - car.x));
+  return {
+    mx: diff > 0.12 ? 1 : diff < -0.12 ? -1 : 0,
+    my: -1, run: false, handbrake: false, firing: false,
+    aimX: tx, aimY: ty, mouseIn: false, enterPressed: false,
+  };
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
+/** On-foot input: walk toward (tx, ty), shooting the nearest enemy when there is one. */
+function footInput(state, tx, ty) {
+  const p = state.player;
+  let aimX = tx;
+  let aimY = ty;
+  let firing = false;
+  let nearest = null;
+  let nearestD = 1e9;
+  for (const e of state.enemies) {
+    if (!e.alive) continue;
+    const d = Math.hypot(e.x - p.x, e.y - p.y);
+    if (d < nearestD) {
+      nearestD = d;
+      nearest = e;
     }
   }
-  return best;
+  if (nearest) {
+    aimX = nearest.x;
+    aimY = nearest.y;
+    firing = nearestD < 520;
+  }
+  const dx = tx - p.x;
+  const dy = ty - p.y;
+  const d = Math.hypot(dx, dy);
+  // Close to a shooting range, then hold and fire.
+  const move = nearest && nearestD < 260 ? 0 : 1;
+  return {
+    mx: d > 12 ? (dx / d) * move : 0,
+    my: d > 12 ? (dy / d) * move : 0,
+    run: false, handbrake: false, firing,
+    aimX, aimY, mouseIn: true, enterPressed: false,
+  };
+}
+
+function putPlayerInCar(state, x, y, angle, color) {
+  const car = {
+    x, y, angle, speed: 0, targetSpeed: 0, color: color || '#c0392b',
+    police: false, parked: false, driver: false, axis: 'h', coord: y, dir: 1, spin: 0,
+  };
+  state.player.car = car;
+  state.player.x = x;
+  state.player.y = y;
+  state.player.angle = angle;
+  state.camera.x = Math.max(0, Math.min(3200 - 1280, x - 640));
+  state.camera.y = Math.max(0, Math.min(2400 - 720, y - 360));
+  return car;
+}
+
+function addPoliceCar(state, x, y, angle, speed) {
+  state.policeCars.push({
+    x, y, angle, speed, targetSpeed: 600, color: '#20242c',
+    police: true, parked: false, driver: false,
+    axis: 'h', coord: y, dir: 1, spin: 0, stuckTimer: 0,
+  });
+}
+
+function stepFor(world, seconds, inputFn) {
+  const steps = Math.round(seconds / STEP);
+  for (let i = 0; i < steps; i += 1) world.step(STEP, inputFn(world.state), SILENT);
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set `world` to the named scene and return the screen to draw over it.
+ * Unknown names stage the street scene.
  */
 export function stageShot(name, world) {
+  const state = world.state;
   world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+  const ui = { hasSave: false, saveMission: 0, saveCash: 0, saveBest: 0, muted: false, message: null };
+
+  if (name === 'cover') {
+    // A getaway in progress: Milo driving west down Palm Row, three stars, the law behind.
+    state.mission.index = 2;
+    startMission(state, SILENT);
+    state.mission.stage = 2;
+    state.mission.stageTimer = 0;
+    state.wanted = 3;
+    putPlayerInCar(state, 2000, 1150, Math.PI, '#2471a3');
+    addPoliceCar(state, 2140, 1150, Math.PI, 540);
+    addPoliceCar(state, 2195, 1118, Math.PI, 510);
+    addPoliceCar(state, 2250, 1184, Math.PI, 480);
+    stepFor(world, 1.5, (s) => driveInput(s, 300, 1150));
+    return { screen: SCREEN_PLAY, ui };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  if (name === 'mission') {
+    // The alley shootout: Milo on foot against Corso's crew, job four in progress.
+    state.player.x = 1300;
+    state.player.y = 1520;
+    state.mission.index = 3;
+    startMission(state, SILENT);
+    stepFor(world, 1.2, (s) => footInput(s, 1300, 1600));
+    return { screen: SCREEN_PLAY, ui };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  if (name === 'harbor') {
+    // Dusk at the harbor: Milo driving the waterfront road north toward the piers,
+    // one star, one unit behind.
+    state.dusk = 1;
+    state.mission.index = 4;
+    state.wanted = 1;
+    putPlayerInCar(state, 2800, 1150, -Math.PI / 2, '#b9770e');
+    addPoliceCar(state, 2800, 1300, -Math.PI / 2, 460);
+    stepFor(world, 1.5, (s) => driveInput(s, 2800, 300));
+    // The staging drive can clip a pedestrian on the waterfront and pick up a
+    // second star; the scene is meant to show one star and no bust in progress.
+    state.wanted = 1;
+    state.bustMeter = 0;
+    return { screen: SCREEN_PLAY, ui };
+  }
+
+  // street: Milo on foot in a busy downtown street, traffic and pedestrians all around.
+  state.player.x = 1800;
+  state.player.y = 1150;
+  state.player.angle = 0;
+  state.camera.x = 1800 - 640;
+  state.camera.y = 1150 - 360;
+  let sr = 1234567;
+  const srand = () => {
+    sr = (sr + 0x6d2b79f5) | 0;
+    let t = Math.imul(sr ^ (sr >>> 15), 1 | sr);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  for (let i = 0; i < 12; i += 1) {
+    const spot = state.city.nearestRoadPoint(1800 + (srand() - 0.5) * 700, 1150 + (srand() - 0.5) * 500);
+    state.peds.push({
+      x: spot.x + 62, y: spot.y, angle: 0, speed: 55, axis: 'h', coord: spot.y,
+      dir: 1, color: ['#d94f4f', '#4f8fd9', '#5fb85f', '#d9a04f'][i % 4],
+      down: false, downTimer: 0, flee: false, fleeX: 0, fleeY: 0, panic: 0,
+    });
+  }
+  stepFor(world, 2.5, (s) => ({
+    mx: 1, my: 0, run: false, handbrake: false, firing: false,
+    aimX: s.player.x + 100, aimY: s.player.y, mouseIn: true, enterPressed: false,
+  }));
+  return { screen: SCREEN_PLAY, ui };
 }
